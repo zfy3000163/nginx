@@ -745,12 +745,267 @@ ngx_exec_new_binary(ngx_cycle_t *cycle, char *const *argv)
     return pid;
 }
 
+#if 1
+#include <openssl/des.h>
+#include <zlib.h>
+#define ENABLE_DES 1
+#define ENABLE_ZLIB 1
+#define __RULE_ENCYPT_KEY "!encrypt data by no password"
+static int m_encrypt(char * src_str, int ilength, FILE *file)
+{
+    DES_cblock key;
+    DES_key_schedule sched; 
+    DES_string_to_key (__RULE_ENCYPT_KEY,&key);
+    DES_set_key_checked(&key,&sched);
+    char input[8] ;
+    bzero(input,8);
+    char output[8];
+    bzero(output,8);
+    uint32_t i32;
+	
+#if ENABLE_ZLIB
+    unsigned long complen = compressBound(ilength); 
+    uint8_t * comptr = calloc(complen, sizeof(uint8_t*));
+    compress(comptr,&complen, (uint8_t*)src_str, ilength);
+#else
+    unsigned long complen = ilength; 
+    //a = ngx_palloc(p, sizeof(ngx_array_t));
+    //name = ngx_alloc(len + 1, ngx_cycle->log);
+    uint8_t * comptr = calloc(complen, sizeof(uint8_t*));
+    memcpy(comptr, src_str, ilength); 
+#endif
+
+    //uint32_t size = complen+3*8; 
+   
+   
+    i32 = complen; 
+    memcpy(input,&i32,sizeof(i32));	
+#if ENABLE_DES
+    DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_ENCRYPT); 
+#else
+    memcpy(output,input,8);
+#endif 
+    fwrite(output,8,1,file);	
+
+   
+    i32= ilength;    
+    memcpy(input,&i32,sizeof(i32));    
+#if ENABLE_DES
+    DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_ENCRYPT); 
+#else
+    memcpy(output,input,8);
+#endif    
+    fwrite(output,8,1,file);
+
+
+    int reset = complen;
+    int i = 0; 
+    while(reset > 0)
+    {
+        if( reset < 8)
+        {
+            memcpy(input,(char*)(comptr+i*8),reset);
+        }
+        else
+        {
+            memcpy(input,(char*)(comptr+i*8),8);
+        }
+#if ENABLE_DES
+    DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_ENCRYPT); 
+#else
+    memcpy(output,input,8);
+#endif 
+        fwrite(output,8,1,file); 
+       // memcpy(enc+(i+2)*8 ,output , 8);
+        i++;
+        reset -=8;
+    }     	
+
+    if(comptr){
+        free(comptr);
+        comptr = NULL;
+    }
+    return 0;
+
+}
+
+
+static uint32_t  m_decrypt(FILE *file, unsigned long  *line_length, char **udata)
+{
+	DES_cblock key;
+    DES_key_schedule sched;
+    DES_string_to_key(__RULE_ENCYPT_KEY,&key);
+    DES_set_key_checked(&key,&sched);
+    char input[8];
+    char output[8];
+
+
+	char* data = NULL;
+
+    uint32_t compresize = 0;
+    uint32_t size = 0;
+    int readsize=0;
+    
+    if(fread(input,8,1,file) <=0)
+    { 
+    //printf("(%s:%d) fread error\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
+    readsize+=8;
+
+#if ENABLE_DES
+    DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_DECRYPT);
+#else
+    memcpy(output,input,8);
+#endif 
+	memcpy(&compresize,output,sizeof(compresize));//get len after compre 
+    if(compresize <=0)
+    {
+        printf("(%s:%d) compresize <= 0\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
+
+    
+
+    if(fread(input,8,1,file)<=0)
+    {
+    printf("(%s:%d) fread error\n", __FUNCTION__, __LINE__);
+        return -1;
+    }
+    readsize+=8;
+#if ENABLE_DES
+    DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_DECRYPT);
+#else
+    memcpy(output,input,8);
+#endif 
+    memcpy(&size,output,sizeof(size));//get len before compre
+
+
+	data = (char*) calloc(compresize, sizeof(char*));
+    int reset = compresize;
+    int i = 0;
+    while(reset > 0) 
+    {
+        memset(output,0,8);
+        if(fread(input,8,1,file)<=0)
+        {
+            free(data);                
+            printf("(%s:%d) fread error\n", __FUNCTION__, __LINE__);
+            return -1;
+        }
+        readsize+=8;
+
+#if ENABLE_DES
+        DES_ecb_encrypt((const_DES_cblock*)(&input),(const_DES_cblock*)(&output),&sched,DES_DECRYPT);
+#else
+        memcpy(output,input,8);
+#endif 
+
+        if(reset < 8)
+        {
+            memcpy(data+ i*8 ,output , reset); 
+        }
+        else 
+        {
+            memcpy(data+ i*8 ,output , 8); 
+        }
+        i++;
+        reset-=8;
+    }        
+    //decompress data
+    *udata = calloc(size, sizeof(uint32_t*));
+    unsigned long uncompsize = size;	
+
+#if ENABLE_ZLIB
+    uncompress((uint8_t*)*udata,&uncompsize,(uint8_t*)data,compresize);
+#else
+    memcpy(*udata,data,uncompsize);
+#endif
+    size = uncompsize ;
+    if(data){
+        free(data);
+        data = NULL;
+    }
+
+    //printf("udata:%s\n", *udata);	
+    *line_length = size;
+    return 0;
+		
+}
+#endif
+
+static int encrypt_file(const char *in_filename,  const char *out_filename)
+{	
+	int ret = -1 ;	
+	char buf[10240];
+
+    FILE *in_fd = fopen(in_filename, "r");
+    if (in_fd == NULL){
+        printf("File %s is open error", in_filename);
+        exit(-1);
+    }
+    FILE *out_fd = fopen(out_filename, "w");
+    if (out_fd == NULL){
+        printf("File %s is open error", out_filename);
+        exit(-1);
+    }
+
+	while(fgets(buf,sizeof(buf),in_fd)!=NULL){
+				
+		ret = m_encrypt(buf, strlen(buf)+1, out_fd);		
+	}	
+
+    fclose(in_fd);
+    fclose(out_fd);
+	return ret;
+}
+
+static int decrypt_file(const char *in_filename, const char *out_filename)
+{	
+    unsigned long len=0;	
+    char *line = NULL;
+
+    FILE *in_fd = fopen(in_filename, "r");
+    if (in_fd == NULL){
+        printf("File %s is open error", in_filename);
+        exit(-1);
+    }
+
+    FILE *out_fd = fopen(out_filename, "w");
+    if (out_fd == NULL){
+        printf("File %s is open error", out_filename);
+        exit(-1);
+    }
+
+    while(!feof(in_fd)){
+
+        line = NULL;
+        m_decrypt(in_fd, &len, &line);		
+        //printf("line:%s \n", line );
+        if(line){
+            fwrite(line, sizeof(char), len-1, out_fd);
+            //free(line);
+        }
+        else{
+            free(line);
+            line = NULL;
+        }
+    }	
+
+    fclose(in_fd);
+    fclose(out_fd);
+
+    return 0;
+}
+
+
 
 static ngx_int_t
 ngx_get_options(int argc, char *const *argv)
 {
     u_char     *p;
     ngx_int_t   i;
+    char *in_file = NULL;
 
     for (i = 1; i < argc; i++) {
 
@@ -838,7 +1093,14 @@ ngx_get_options(int argc, char *const *argv)
 
                 ngx_log_stderr(0, "option \"-c\" requires file name");
                 return NGX_ERROR;
-
+	    case 'D':
+                in_file = (char*)ngx_conf_file;
+                decrypt_file(in_file, "./nginx_decrypt.conf");
+                exit(0);
+            case 'E':
+                in_file = (char*)ngx_conf_file;
+                encrypt_file(in_file, "./nginx_encrypt.conf");
+                exit(0);
             case 'g':
                 if (*p) {
                     ngx_conf_params = p;
